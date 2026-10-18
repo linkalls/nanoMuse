@@ -164,14 +164,35 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
             .url("https://auth.openai.com/api/accounts/oauth/token")
             .post(form.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
             .build()
-        val data = systemAwareHttpClient.newCall(req).execute().use { response ->
-            if (!response.isSuccessful) throw IllegalStateException("ChatGPT plan token exchange rejected (HTTP ${response.code})")
-            JSONObject(response.body?.string() ?: "{}")
+        // A Chrome Custom Tab may resolve via the currently active VPN while
+        // OkHttp's Java DNS resolver still has a stale network. Retry fresh
+        // lookups on DNS failure, then report a network error. NEVER log the
+        // authorization code, the form body, or the resulting tokens.
+        var lastDnsFailure: UnknownHostException? = null
+        var data: JSONObject? = null
+        for (attempt in 1..3) {
+            try {
+                data = systemAwareHttpClient.newCall(req).execute().use { response ->
+                    if (!response.isSuccessful) throw IllegalStateException(
+                        "ChatGPT plan token exchange rejected (HTTP ${response.code})"
+                    )
+                    JSONObject(response.body?.string() ?: "{}")
+                }
+                break
+            } catch (e: UnknownHostException) {
+                lastDnsFailure = e
+                AppLogger.warning(TAG, "ChatGPT plan token exchange DNS failed (attempt $attempt of 3)")
+                if (attempt < 3) Thread.sleep(600L * attempt)
+            }
         }
-        val access = data.optString("access_token")
-        val idToken = data.optString("id_token")
+        if (data == null) throw OAuthNetworkUnreachableException(
+            lastDnsFailure ?: UnknownHostException("Cannot resolve ChatGPT authorization host")
+        )
+        val responseData = data
+        val access = responseData.optString("access_token")
+        val idToken = responseData.optString("id_token")
         require(access.isNotBlank() && idToken.isNotBlank()) { "Incomplete ChatGPT plan credentials" }
-        val scope = data.optString("scope")
+        val scope = responseData.optString("scope")
         val permissions = scope.split(' ').toSet()
         require("chatgpt.tokens.use.direct" in permissions && "resource.invoke" in permissions) {
             "ChatGPT plan access was not approved for this account"
@@ -181,10 +202,10 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
         require(previouslyVerified == null || previouslyVerified == identity.optString("sub")) {
             "ChatGPT account changed; use a separate provider for another account"
         }
-        val expires = data.optLong("expires_in")
-        if (expires > 0) data.put("expire_at", System.currentTimeMillis() + expires * 1000)
+        val expires = responseData.optLong("expires_in")
+        if (expires > 0) responseData.put("expire_at", System.currentTimeMillis() + expires * 1000)
         // Atomic credential state only after verification and permissions.
-        saveOAuthString("tokens", data.toString())
+        saveOAuthString("tokens", responseData.toString())
         saveOAuthString("siwc_client_id", issuedId)
         saveOAuthString("siwc_subject", identity.getString("sub"))
         parseIdToken(idToken)
@@ -382,7 +403,14 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
      * (network may have switched between cold-start and tap-Sign-in).
      */
     private val systemAwareHttpClient: okhttp3.OkHttpClient by lazy {
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? android.net.ConnectivityManager
         okhttp3.OkHttpClient.Builder()
+            .dns(AndroidActiveNetworkDns(
+                activeNetworkLookup = { host ->
+                    connectivity?.activeNetwork?.getAllByName(host)?.toList()
+                },
+            ))
             .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
             .proxySelector(ProxySelector.getDefault())
