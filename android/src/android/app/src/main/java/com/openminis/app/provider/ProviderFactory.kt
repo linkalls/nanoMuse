@@ -69,7 +69,7 @@ object ProviderFactory {
                         oauthTokenProvider = { oauthManager.validAccessToken() ?: throw com.openminis.app.data.model.LLMError.InvalidApiKey() },
                         model = model,
                         codexAccountId = oauthManager.accountId,
-                    )
+                    ).also { it.chatGptPlanMode = oauthManager.isChatGptPlan }
                 } else {
                     // API key, or manual OAuth bearer (with or without custom
                     // base URL). The user can flip `useResponsesAPI` on a

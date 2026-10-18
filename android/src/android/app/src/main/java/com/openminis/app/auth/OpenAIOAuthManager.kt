@@ -48,92 +48,182 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
      * Perform the full OAuth login flow.
      * Returns the access token. Throws on failure.
      */
+    /**
+     * Official Sign in with ChatGPT / plan usage authorization. This is an opt-in
+     * re-sign-in for existing Codex-OAuth users: legacy saved tokens stay valid
+     * until the new flow has exchanged AND verified all granted credentials.
+     */
     suspend fun performLogin(context: Context): String {
-        AppLogger.info(TAG, "=== OAuth login started (instance=$instanceId) ===")
-
         loginCallbackServer?.stop()
         loginCallbackServer = null
-
         val authUrl = buildAuthorizationUrl()
-        // Redact the code_challenge so the log doesn't expose PKCE material
-        // verbatim — leave everything else so the user/diagnostician can
-        // verify scope, redirect_uri, client_id, state.
-        val redactedAuthUrl = authUrl.replace(Regex("code_challenge=[^&]+"), "code_challenge=<redacted>")
-        AppLogger.info(TAG, "authorize URL: $redactedAuthUrl")
-        AppLogger.info(TAG, "redirect_uri=$redirectUri callbackPort=$callbackPort")
-
-        val accessToken = withContext(Dispatchers.IO) {
-            // Step 1: Wait for callback code
-            val (code, state) = suspendCancellableCoroutine<Pair<String, String?>> { cont ->
-                val server = OAuthCallbackServer(callbackPort) { receivedCode, receivedState ->
-                    if (cont.isActive) {
-                        cont.resume(receivedCode to receivedState)
-                    }
-                }
-                loginCallbackServer = server
-                server.start()
-                AppLogger.info(TAG, "callback server listening on port $callbackPort path=$redirectPath")
-
-                cont.invokeOnCancellation {
-                    server.stop()
+        val params = withContext(Dispatchers.IO) {
+            suspendCancellableCoroutine<Map<String, String>> { continuation ->
+                val listener = OAuthCallbackServer(
+                    port = callbackPort,
+                    onCode = { _, _ -> },
+                    onParameters = { result ->
+                        if (continuation.isActive) continuation.resume(result)
+                    },
+                    loopbackOnly = true,
+                )
+                loginCallbackServer = listener
+                listener.start()
+                continuation.invokeOnCancellation {
+                    listener.stop()
                     loginCallbackServer = null
                 }
-
-                // Open auth URL in Chrome Custom Tab. Do NOT set FLAG_ACTIVITY_NEW_TASK:
-                // MainActivity is singleTask, and launching Custom Tab in a new task causes
-                // the IME to be dismissed whenever the authorization page focuses an input.
-                val customTabsIntent = CustomTabsIntent.Builder()
-                    .setShowTitle(true)
-                    .build()
-                customTabsIntent.launchUrl(context, Uri.parse(authUrl))
-                AppLogger.info(TAG, "Custom Tab launched")
+                CustomTabsIntent.Builder().setShowTitle(true).build()
+                    .launchUrl(context, Uri.parse(authUrl))
             }
-
-            loginCallbackServer?.stop()
-            loginCallbackServer = null
-            val stateMatches = expectedState != null && state == expectedState
-            AppLogger.info(
-                TAG,
-                "callback received: codeLen=${code.length} state=$state expected=$expectedState match=$stateMatches",
-            )
-            if (!stateMatches) {
-                AppLogger.warning(TAG, "state mismatch — proceeding anyway to mirror prior behaviour")
-            }
-
-            // Step 2: Exchange code for tokens (JSON body, matching iOS CodexOAuthManager)
-            exchangeCodeJson(code)
         }
-
-        AppLogger.info(TAG, "=== OAuth login complete (instance=$instanceId tokenLen=${accessToken.length}) ===")
-        return accessToken
+        loginCallbackServer?.stop()
+        loginCallbackServer = null
+        val receivedState = params["state"].orEmpty()
+        // State is REQUIRED on ALL callbacks, including OAuth error responses.
+        require(receivedState.isNotEmpty() && receivedState == expectedState) { "ChatGPT login state mismatch" }
+        params["error"]?.let { throw IllegalStateException("ChatGPT authorization: $it") }
+        val code = params["code"].orEmpty()
+        require(code.isNotBlank()) { "ChatGPT login returned no authorization code" }
+        val registeredId = loadOAuthString("siwc_client_id")
+        val issuedId = if (registeredId.isNullOrBlank()) {
+            params["client_id"]?.takeIf { it.startsWith("oaiapp_") }
+                ?: throw IllegalStateException("ChatGPT plan registration did not issue a client ID")
+        } else {
+            val callbackId = params["client_id"]
+            require(callbackId.isNullOrEmpty() || callbackId == registeredId) { "ChatGPT registered client mismatch" }
+            registeredId
+        }
+        return withContext(Dispatchers.IO) { exchangePlanCode(code, issuedId) }
     }
 
-    override val authURL = "https://auth.openai.com/oauth/authorize"
-    override val tokenURL = "https://auth.openai.com/oauth/token"
-    override val clientId = "app_EMoamEEZ73f0CkXaXp7hrann"
+    // Existing legacy Codex tokens still refresh with their own issuer/client.
+    val isChatGptPlan: Boolean get() = !loadOAuthString("siwc_client_id").isNullOrBlank()
+    override val authURL = "https://auth.openai.com/api/accounts/authorize"
+    override val tokenURL: String
+        get() = if (isChatGptPlan) "https://auth.openai.com/api/accounts/oauth/token" else "https://auth.openai.com/oauth/token"
+    override val clientId: String
+        get() = loadOAuthString("siwc_client_id") ?: "app_EMoamEEZ73f0CkXaXp7hrann"
     override val clientSecret: String? = null
     override val callbackPort = 1455
     override val redirectPath = "/auth/callback"
-    override val scopes = "openid profile email offline_access"
+    override val redirectUri: String get() = "http://127.0.0.1:$callbackPort$redirectPath"
+    override val scopes = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+
+    private var pendingNonce: String? = null
+
+    override fun generateAndSavePKCE(): Pair<String, String> = generatePKCE().also { (verifier, _) ->
+        saveOAuthString("verifier", verifier)
+    }
 
     override fun buildAuthorizationUrl(): String {
-        val (verifier, challenge) = generatePKCE()
-        saveOAuthString("verifier", verifier)
+        val (_, challenge) = generateAndSavePKCE()
         val state = generateState()
         expectedState = state
-        AppLogger.debug(TAG, "PKCE: verifierLen=${verifier.length} stateLen=${state.length}")
-        return "$authURL?" + listOf(
-            "client_id=$clientId",
-            "redirect_uri=${Uri.encode(redirectUri)}",
-            "response_type=code",
-            "scope=${Uri.encode(scopes)}",
-            "state=$state",
-            "code_challenge=$challenge",
-            "code_challenge_method=S256",
-            "codex_cli_simplified_flow=true",
-            "originator=codex_cli_rs",
-            "id_token_add_organizations=true",
-        ).joinToString("&")
+        val nonce = java.util.UUID.randomUUID().toString()
+        pendingNonce = nonce
+        val hostId = loadOAuthString("siwc_host_id") ?: ("urn:uuid:" + java.util.UUID.randomUUID()).also {
+            saveOAuthString("siwc_host_id", it)
+        }
+        val registeredId = loadOAuthString("siwc_client_id")
+        val requestId = registeredId ?: "dynamic_agent_client"
+        val params = linkedMapOf(
+            "client_id" to requestId,
+            "ext_agent_host_id" to hostId,
+            "redirect_uri" to redirectUri,
+            "response_type" to "code",
+            "scope" to scopes,
+            "resource" to "https://api.openai.com/v1",
+            "state" to state,
+            "nonce" to nonce,
+            "code_challenge" to challenge,
+            "code_challenge_method" to "S256",
+        )
+        if (registeredId.isNullOrBlank()) params["agent_name_hint"] = "nanoMuse"
+        else loadStoredTokens()?.optString("id_token")?.takeIf { it.isNotBlank() }?.let { params["id_token_hint"] = it }
+        return authURL + "?" + params.entries.joinToString("&") { (k,v) ->
+            "${Uri.encode(k)}=${Uri.encode(v)}"
+        }
+    }
+
+    /** Uses form encoding and the registration-issued client ID, never the
+     * legacy Codex client ID. Persist only after full ID-token validation. */
+    private fun exchangePlanCode(code: String, issuedId: String): String {
+        val verifier = loadOAuthString("verifier")
+            ?: throw IllegalStateException("Missing PKCE verifier")
+        val fields = linkedMapOf(
+            "grant_type" to "authorization_code",
+            "client_id" to issuedId,
+            "code" to code,
+            "code_verifier" to verifier,
+            "redirect_uri" to redirectUri,
+            "resource" to "https://api.openai.com/v1",
+        )
+        val form = fields.entries.joinToString("&") { (k,v) -> "${Uri.encode(k)}=${Uri.encode(v)}" }
+        val req = okhttp3.Request.Builder()
+            .url("https://auth.openai.com/api/accounts/oauth/token")
+            .post(form.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
+            .build()
+        val data = systemAwareHttpClient.newCall(req).execute().use { response ->
+            if (!response.isSuccessful) throw IllegalStateException("ChatGPT plan token exchange rejected (HTTP ${response.code})")
+            JSONObject(response.body?.string() ?: "{}")
+        }
+        val access = data.optString("access_token")
+        val idToken = data.optString("id_token")
+        require(access.isNotBlank() && idToken.isNotBlank()) { "Incomplete ChatGPT plan credentials" }
+        val scope = data.optString("scope")
+        val permissions = scope.split(' ').toSet()
+        require("chatgpt.tokens.use.direct" in permissions && "resource.invoke" in permissions) {
+            "ChatGPT plan access was not approved for this account"
+        }
+        val identity = ChatGptPlanOidc.verify(idToken, issuedId, pendingNonce.orEmpty(), systemAwareHttpClient)
+        val previouslyVerified = loadOAuthString("siwc_subject")
+        require(previouslyVerified == null || previouslyVerified == identity.optString("sub")) {
+            "ChatGPT account changed; use a separate provider for another account"
+        }
+        val expires = data.optLong("expires_in")
+        if (expires > 0) data.put("expire_at", System.currentTimeMillis() + expires * 1000)
+        // Atomic credential state only after verification and permissions.
+        saveOAuthString("tokens", data.toString())
+        saveOAuthString("siwc_client_id", issuedId)
+        saveOAuthString("siwc_subject", identity.getString("sub"))
+        parseIdToken(idToken)
+        return access
+    }
+
+    override suspend fun refreshToken(): Boolean {
+        if (!isChatGptPlan) return super.refreshToken()
+        return withContext(Dispatchers.IO) {
+            val old = loadStoredTokens() ?: return@withContext false
+            val refresh = old.optString("refresh_token").takeIf { it.isNotBlank() } ?: return@withContext false
+            val params = linkedMapOf(
+                "grant_type" to "refresh_token",
+                "refresh_token" to refresh,
+                "client_id" to clientId,
+                "resource" to "https://api.openai.com/v1",
+            )
+            val form = params.entries.joinToString("&") { (k,v) -> "${Uri.encode(k)}=${Uri.encode(v)}" }
+            runCatching {
+                val req = okhttp3.Request.Builder()
+                    .url(tokenURL)
+                    .post(form.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
+                    .build()
+                val newer = systemAwareHttpClient.newCall(req).execute().use { response ->
+                    if (!response.isSuccessful) return@withContext false
+                    JSONObject(response.body?.string() ?: "{}")
+                }
+                require(newer.optString("access_token").isNotBlank())
+                val scopes = newer.optString("scope", old.optString("scope")).split(' ').toSet()
+                require("chatgpt.tokens.use.direct" in scopes && "resource.invoke" in scopes)
+                if (!newer.has("refresh_token")) newer.put("refresh_token", refresh)
+                if (!newer.has("id_token")) newer.put("id_token", old.optString("id_token"))
+                if (!newer.has("scope")) newer.put("scope", old.optString("scope"))
+                val expires = newer.optLong("expires_in")
+                if (expires > 0) newer.put("expire_at", System.currentTimeMillis() + expires * 1000)
+                saveOAuthString("tokens", newer.toString())
+                true
+            }.getOrElse { false }
+        }
     }
 
     var accountId: String?
