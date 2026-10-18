@@ -103,6 +103,11 @@ class OpenAIProvider private constructor(
      */
     var thinkingRuleInstanceId: String? = null
 
+    /** Official ChatGPT plan-sharing OAuth uses the public Responses API, not
+     * the private Codex backend. Legacy Codex OAuth remains unchanged. */
+    var chatGptPlanMode: Boolean = false
+
+
     /**
      * [T-android-xai-priority] Whether this provider speaks xAI's Priority
      * Processing extension, i.e. whether it is eligible to carry
@@ -398,7 +403,7 @@ class OpenAIProvider private constructor(
      * Only meaningful on the Codex OAuth path; everything else (the GPT-5.x
      * Codex models and their existing OAuth flow) is untouched by this gate.
      */
-    private val isCodexImageModel: Boolean get() = isOAuth && model.id == "gpt-image-2"
+    private val isCodexImageModel: Boolean get() = isOAuth && !chatGptPlanMode && model.id == "gpt-image-2"
 
     private suspend fun getToken(): String {
         oauthTokenProvider?.let { return it() }
@@ -2403,6 +2408,17 @@ class OpenAIProvider private constructor(
                 override fun contentLength() = bodyBytes.size.toLong()
                 override fun writeTo(sink: okio.BufferedSink) { sink.write(bodyBytes) }
             }
+
+            // Official Sign in with ChatGPT: no forged Codex headers or account
+            // claims. The bearer has the explicit chatgpt.tokens.use.direct scope.
+            if (chatGptPlanMode) {
+                return Request.Builder()
+                    .url("https://api.openai.com/v1/responses")
+                    .post(requestBody)
+                    .header("Authorization", "Bearer $token")
+                    .header("Content-Type", "application/json")
+                    .build()
+            }
             val builder = Request.Builder()
                 .url("https://chatgpt.com/backend-api/codex/responses")
                 .post(requestBody)
@@ -3325,6 +3341,32 @@ class OpenAIProvider private constructor(
             }
         }
         body.put("input", input)
+        if (chatGptPlanMode) {
+            // Sign in with ChatGPT plan usage requires stateless stream requests.
+            // The public plan-use preview explicitly rejects these legacy hints.
+            for (name in listOf(
+                "prompt_cache_key", "prompt_cache_retention", "max_output_tokens",
+                "temperature", "top_p", "service_tier", "include", "background",
+                "metadata", "previous_response_id", "conversation", "truncation",
+            )) body.remove(name)
+            body.put("store", false)
+            body.put("stream", true)
+            // The plan-use route accepts local function definitions as an
+            // additional_tools developer input item, not top-level flat tools.
+            val flatTools = body.optJSONArray("tools")
+            if (flatTools != null && flatTools.length() > 0) {
+                val withTools = JSONArray()
+                withTools.put(JSONObject().apply {
+                    put("type", "additional_tools")
+                    put("role", "developer")
+                    put("tools", flatTools)
+                })
+                for (i in 0 until input.length()) withTools.put(input.get(i))
+                body.put("input", withTools)
+            }
+            body.remove("tools")
+            body.remove("tool_choice")
+        }
 
         // [T-android-model-use-passthrough-mode GH#72] Same verbatim merge as the
         // chat-completions builder. Skipped for Codex OAuth inside mergeChatExtraBody.

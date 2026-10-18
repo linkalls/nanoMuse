@@ -9,6 +9,10 @@ import java.net.URI
 class OAuthCallbackServer(
     private val port: Int,
     private val fallbackPorts: List<Int> = emptyList(),
+    // Optional callback for first-time dynamic OAuth registration (returns issued client_id).
+    private val onParameters: ((Map<String, String>) -> Unit)? = null,
+    private val loopbackOnly: Boolean = false,
+    // Keep callback LAST to preserve existing OAuthCallbackServer(port) { code, state -> ... } callers.
     private val onCode: (code: String, state: String?) -> Unit,
 ) {
     companion object {
@@ -43,7 +47,7 @@ class OAuthCallbackServer(
                 var bound = false
                 for (p in portsToTry) {
                     try {
-                        serverSocket = ServerSocket(p)
+                        serverSocket = if (loopbackOnly) ServerSocket(p, 5, java.net.InetAddress.getByName("127.0.0.1")) else ServerSocket(p)
                         boundPort = p
                         bound = true
                         break
@@ -61,7 +65,7 @@ class OAuthCallbackServer(
                     try {
                         val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                         val requestLine = reader.readLine() ?: continue
-                        Log.d(TAG, "Request: $requestLine")
+                        Log.d(TAG, "OAuth callback received") // Never log authorization codes or states.
 
                         // CORS preflight for providers (e.g. xAI) that
                         // OPTIONS /callback from their authorization page
@@ -108,6 +112,10 @@ class OAuthCallbackServer(
 
                             val code = params["code"]
                             val state = params["state"]
+                            if (loopbackOnly && uri.path != "/auth/callback") {
+                                socket.close()
+                                continue
+                            }
 
                             // Send response
                             val html = "<html><body><h1>Authorization complete</h1><p>You can close this tab.</p><script>window.close()</script></body></html>"
@@ -115,6 +123,11 @@ class OAuthCallbackServer(
                             socket.getOutputStream().write(response.toByteArray())
                             socket.close()
 
+                            if (onParameters != null && (code != null || params.containsKey("error"))) {
+                                onParameters.invoke(params)
+                                stop()
+                                return@Thread
+                            }
                             if (code != null) {
                                 onCode(code, state)
                                 stop()

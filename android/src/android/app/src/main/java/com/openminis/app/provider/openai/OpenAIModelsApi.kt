@@ -89,6 +89,42 @@ object OpenAIModelsApi {
         ModelsDevApi.enrichModels(merged) + codexImageModels
     }
 
+    /** Model catalog for official ChatGPT plan-sharing tokens. Never append the
+     * Codex fallback list: a model shown here must actually be returned by the
+     * account-specific public endpoint. Even then, inference is the final check. */
+    suspend fun fetchModelsChatGptPlan(accessToken: String): List<LLMModel> = withContext(Dispatchers.IO) {
+        if (accessToken.isBlank()) return@withContext emptyList()
+        try {
+            val request = Request.Builder()
+                .url("https://api.openai.com/v1/models")
+                .header("Authorization", "Bearer $accessToken")
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@withContext emptyList()
+                val rows = JSONObject(response.body?.string() ?: "{}").optJSONArray("models")
+                    ?: return@withContext emptyList()
+                val models = mutableListOf<LLMModel>()
+                val seen = mutableSetOf<String>()
+                for (i in 0 until rows.length()) {
+                    val row = rows.optJSONObject(i) ?: continue
+                    if (row.optString("visibility") != "list") continue
+                    val slug = row.optString("slug").trim()
+                    if (slug.isEmpty() || !seen.add(slug)) continue
+                    models.add(LLMModel(
+                        id = slug,
+                        displayName = row.optString("display_name").ifBlank { slug },
+                        provider = "OpenAI",
+                        supportsReasoning = true,
+                    ))
+                }
+                return@withContext ModelsDevApi.enrichModels(models)
+            }
+        } catch (e: Exception) {
+            AppLogger.warning(TAG, "ChatGPT plan model catalog unavailable: ${e.javaClass.simpleName}")
+            emptyList()
+        }
+    }
+
     // nanoMuse: parse `{"models":[{"slug":"gpt-6.1-sol","display_name":"...","visibility":"list"}, ...]}`
     internal fun parseCodexModelsJson(body: String): List<LLMModel> = try {
         val rows = JSONObject(body).optJSONArray("models") ?: JSONArray()

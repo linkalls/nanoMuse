@@ -2195,8 +2195,12 @@ class ProviderRepository(private val context: Context) {
             && instance.credentialType == ProviderCredential.oauth
         ) {
             // nanoMuse: query live Codex OAuth models with accountId (#475)
-            val accountId = runCatching { com.openminis.app.auth.OpenAIOAuthManager(context, instance.id).accountId }.getOrNull()
-            val models = OpenAIModelsApi.fetchModelsOAuth(apiKey, accountId)
+            val oauthManager = com.openminis.app.auth.OpenAIOAuthManager(context, instance.id)
+            val models = if (oauthManager.isChatGptPlan) {
+                OpenAIModelsApi.fetchModelsChatGptPlan(apiKey.orEmpty())
+            } else {
+                OpenAIModelsApi.fetchModelsOAuth(apiKey, oauthManager.accountId)
+            }
             if (models.isNotEmpty()) {
                 replaceEntries(instance.id, models)
                 return
